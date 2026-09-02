@@ -1,0 +1,22 @@
+heic2jpg bundles third-party software in vendor/:
+
+libheif.js, libheif.wasm
+  An Emscripten build of libheif with the libde265 HEVC decoder, taken unmodified
+  from the npm package libheif-js 1.19.8 (files libheif-wasm/libheif.js and
+  libheif-wasm/libheif.wasm).
+    sha256 libheif.js   fdc7bcb67bedccc5a7cdd8064a627b389d1c1a93d985b55bd741e1cadd2a34f8
+    sha256 libheif.wasm 615bfe847f823d008d4a5bdb3e8286029f72a0f581e120115c2d6478e3c37fb3
+
+  libheif    Copyright (c) struktur AG and contributors. LGPL-3.0.
+             https://github.com/strukturag/libheif
+  libde265   Copyright (c) struktur AG and contributors. LGPL-3.0.
+             https://github.com/strukturag/libde265
+  libheif-js Copyright (c) Kiril Vatev. MIT.
+             https://github.com/catdad-experiments/libheif-js
+
+  Licence texts: vendor/LICENSE-libheif (LGPL-3.0), vendor/LICENSE-libheif-js (MIT).
+
+The LGPL-3.0 components are used as a separately identifiable WebAssembly module
+that the page loads at runtime. You may replace vendor/libheif.wasm and
+vendor/libheif.js with your own build of libheif; source for the exact version is
+available at the repositories above.

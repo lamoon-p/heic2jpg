@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HEIC to JPG</title>
+<meta name="description" content="Convert HEIC photos to JPG in your browser. Nothing is uploaded.">
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#111; --mut:#666; --line:#ddd; --ok:#2a7; --bad:#c33; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#eee; --mut:#999; --line:#333; } }
+  body { background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, sans-serif;
+         margin:0; min-height:100vh; display:grid; place-items:start center; padding:2rem 1rem; }
+  main { width:min(34rem,100%); display:grid; gap:1rem; }
+  h1 { font-size:1.1rem; font-weight:600; margin:0; color:var(--mut); }
+  p { margin:0; }
+  .lead, .msg, small { color:var(--mut); font-size:.875rem; }
+  .drop { display:grid; place-items:center; padding:2rem 1rem; border:2px dashed var(--line); border-radius:.75rem;
+          text-align:center; cursor:pointer; }
+  .drop.over { border-color:var(--fg); }
+  .drop input { display:none; }
+  ul { list-style:none; margin:0; padding:0; display:grid; gap:.25rem; font-size:.875rem; }
+  li { display:grid; grid-template-columns:1fr auto; gap:.25rem .75rem; padding:.4rem 0; border-bottom:1px solid var(--line); }
+  li .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  li .status { color:var(--mut); text-align:right; white-space:nowrap; }
+  li .status.err { color:var(--bad); }
+  li .status.ok { color:var(--ok); }
+  li .warn { grid-column:1 / -1; color:var(--mut); font-size:.75rem; }
+  li a { color:inherit; }
+  label { display:flex; justify-content:space-between; font-size:.875rem; }
+  input[type=range] { width:100%; }
+  button { font:inherit; width:100%; padding:.6rem .75rem; border-radius:.5rem;
+           border:1px solid var(--line); background:var(--bg); color:var(--fg); cursor:pointer; }
+  button:disabled { opacity:.4; cursor:default; }
+  details { font-size:.875rem; color:var(--mut); }
+  details ul { list-style:disc; padding-left:1.25rem; gap:.25rem; margin-top:.5rem; }
+  details li { display:list-item; border:0; padding:0; }
+  footer { font-size:.75rem; color:var(--mut); }
+  footer a { color:inherit; }
+</style>
+</head>
+<body>
+<main>
+  <h1>HEIC to JPG</h1>
+  <p class="lead">Converts on your device. Your photos never leave this browser tab.</p>
+
+  <label class="drop" id="drop">
+    <input id="files" type="file" accept=".heic,.heif,image/heic,image/heif" multiple>
+    <span>Drop HEIC files here, or tap to choose</span>
+  </label>
+
+  <ul id="list"></ul>
+
+  <div>
+    <label for="q">JPG quality <output id="qv">92</output></label>
+    <input id="q" type="range" min="60" max="100" value="92" disabled>
+    <p class="msg" id="est">Add photos to enable the quality slider.</p>
+  </div>
+
+  <button id="convert" disabled>Convert</button>
+  <button id="download" hidden>Download</button>
+  <p class="msg" id="msg"></p>
+
+  <details>
+    <summary>Limitations and how it works</summary>
+    <ul>
+      <li><b>JPG is lossy.</b> Even at quality 100 the pixels are re-compressed. There is no lossless path from HEIC to JPG.</li>
+      <li><b>HDR and 10-bit photos are flattened</b> to 8-bit standard range. Highlight detail beyond SDR is lost.</li>
+      <li><b>Location (GPS) is removed on purpose.</b> Date, camera, lens and exposure EXIF are kept. Rotation is baked into the pixels.</li>
+      <li><b>Colour profile</b> (usually Display P3) is copied across only when the source has one. Viewers that ignore profiles will look slightly muted.</li>
+      <li><b>The size under the slider is an estimate</b> from one photo, scaled by pixel count. The real total appears after converting.</li>
+      <li><b>Live Photos and bursts:</b> only the main still is converted. Motion, depth and gain-map data are dropped.</li>
+      <li><b>Memory:</b> converted files are held in this tab until you download. A few hundred 12-megapixel photos may exhaust a phone browser. Use smaller batches.</li>
+      <li><b>No network.</b> After the page loads it makes no requests at all. Check the Network tab if you like. Decoding uses libheif compiled to WebAssembly, shipped with this page.</li>
+    </ul>
+  </details>
+
+  <footer><a href="https://github.com/lamoon-p/heic2jpg">Source</a> · MIT, with libheif under LGPL-3.0</footer>
+</main>
+
+<script src="lib.js"></script>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const $files = $('files'), $drop = $('drop'), $list = $('list'), $q = $('q'), $qv = $('qv'), $est = $('est'),
+      $convert = $('convert'), $download = $('download'), $msg = $('msg');
+
+const MAX_BYTES = 100 * 1024 * 1024; // ponytail: hard cap so one mislabelled file can't blow the wasm heap
+let items = [];          // { id, name, outName, width, height, state, li, result }
+let nextId = 1, converting = false, converted = false, pending = new Map();   // converted: Convert was pressed for the current quality
+const quality = () => $q.value / 100;
+const fmt = n => n < 1024 * 1024 ? (n / 1024).toFixed(0) + ' KB' : (n / 1024 / 1024).toFixed(1) + ' MB';
+
+if (typeof OffscreenCanvas === 'undefined' || typeof Worker === 'undefined')
+  $msg.textContent = 'This browser is too old: it lacks OffscreenCanvas. Use a current Chrome, Firefox, Edge or Safari 16.4+.';
+
+const worker = new Worker('worker.js');
+worker.onerror = e => { $msg.textContent = 'Worker failed: ' + e.message; };
+worker.onmessage = e => {
+  const m = e.data, it = items.find(i => i.id === m.id);
+  if (!it) return;
+  if (m.type === 'opened') { it.width = m.width; it.height = m.height; setState(it, 'ready', `${m.width}×${m.height}`); }
+  else if (m.type === 'error') { setState(it, 'error', m.message); }
+  else if (m.type === 'encoded') { it.result = { quality: m.quality, bytes: m.bytes, size: m.size, warnings: m.warnings, blob: new Blob([m.bytes], { type: 'image/jpeg' }) }; }
+  const p = pending.get(m.id); if (p) { pending.delete(m.id); p(m); }
+  refresh();
+};
+const ask = msg => new Promise(res => { pending.set(msg.id, res); worker.postMessage(msg); });
+
+function setState(it, state, text) {
+  it.state = state;
+  it.li.querySelector('.status').textContent = text;
+  it.li.querySelector('.status').className = 'status' + (state === 'error' ? ' err' : state === 'done' ? ' ok' : '');
+}
+
+function uniqueName(base, used) {
+  let name = base + '.jpg', n = 2;
+  while (used.has(name.toLowerCase())) name = `${base} (${n++}).jpg`;
+  used.add(name.toLowerCase());
+  return name;
+}
+
+async function addFiles(list) {
+  if (converting) return;
+  reset();
+  const used = new Set();
+  for (const file of list) {
+    const li = document.createElement('li');
+    li.innerHTML = '<span class="name"></span><span class="status">reading…</span>';
+    li.querySelector('.name').textContent = file.name;
+    $list.appendChild(li);
+    const it = { id: nextId++, name: file.name, outName: uniqueName(file.name.replace(/\.[^.]+$/, ''), used), state: 'opening', li, result: null };
+    items.push(it);
+    if (file.size > MAX_BYTES) { setState(it, 'error', 'over 100 MB, skipped'); continue; }
+    const buffer = await file.arrayBuffer();
+    worker.postMessage({ type: 'open', id: it.id, buffer }, [buffer]);
+  }
+}
+
+function reset() {
+  for (const it of items) if (it.url) URL.revokeObjectURL(it.url);
+  items = []; $list.innerHTML = ''; pending.clear(); converted = false;
+  worker.postMessage({ type: 'reset' });
+  $download.hidden = true; $msg.textContent = '';
+}
+
+const okItems = () => items.filter(i => i.state !== 'error' && i.state !== 'opening');
+const sample = () => okItems().reduce((a, b) => (!a || b.width * b.height > a.width * a.height) ? b : a, null);
+
+let estTimer;
+function refresh() {
+  const ok = okItems(), all = items.every(i => i.state !== 'opening');
+  $q.disabled = !ok.length || converting;
+  $convert.disabled = !ok.length || !all || converting;
+  $convert.textContent = converting ? 'Converting…' : ok.length > 1 ? `Convert ${ok.length} photos` : 'Convert';
+  const done = converted && ok.length && ok.every(i => i.result && i.result.quality === quality());
+  $download.hidden = !done;
+  if (done) {
+    const total = ok.reduce((s, i) => s + i.result.size, 0);
+    $download.textContent = ok.length > 1 ? `Download ${ok.length} JPGs as ZIP (${fmt(total)})` : `Download ${ok[0].outName} (${fmt(total)})`;
+  }
+  for (const it of ok) {
+    if (converted && it.result && it.result.quality === quality()) {
+      if (it.state !== 'done') {
+        if (it.url) URL.revokeObjectURL(it.url);
+        it.url = URL.createObjectURL(it.result.blob);
+        setState(it, 'done', '');
+        const a = Object.assign(document.createElement('a'), { href: it.url, download: it.outName, textContent: `${fmt(it.result.size)} · download` });
+        it.li.querySelector('.status').appendChild(a);
+        let w = it.li.querySelector('.warn');
+        if (it.result.warnings.length) { if (!w) { w = document.createElement('span'); w.className = 'warn'; it.li.appendChild(w); } w.textContent = it.result.warnings.join(' · '); }
+        else if (w) w.remove();
+      }
+    } else if (it.state === 'done') setState(it, 'ready', `${it.width}×${it.height}`);
+  }
+  if (!ok.length) $est.textContent = items.length ? 'No convertible photos.' : 'Add photos to enable the quality slider.';
+  else if (all && !converting && !done) { clearTimeout(estTimer); estTimer = setTimeout(estimate, 250); }
+}
+
+async function estimate() {
+  const s = sample(); if (!s || converting) return;
+  const q = quality();
+  if (!s.result || s.result.quality !== q) { $est.textContent = 'Estimating…'; await ask({ type: 'encode', id: s.id, quality: q }); }
+  if (quality() !== q || !s.result) return;             // slider moved meanwhile; a newer estimate is on its way
+  const perPixel = s.result.size / (s.width * s.height);
+  const total = okItems().reduce((sum, i) => sum + perPixel * i.width * i.height, 0);
+  $est.textContent = okItems().length > 1
+    ? `≈ ${fmt(s.result.size)} for ${s.outName} · ≈ ${fmt(total)} total (estimate from the largest photo)`
+    : `≈ ${fmt(s.result.size)} (estimate)`;
+}
+
+async function convert() {
+  converting = true; refresh();
+  const q = quality(), todo = okItems();
+  let n = 0;
+  for (const it of todo) {
+    $msg.textContent = `Converting ${++n} of ${todo.length}…`;
+    if (it.result && it.result.quality === q) continue;
+    setState(it, 'working', 'converting…');
+    const m = await ask({ type: 'encode', id: it.id, quality: q });
+    if (m.type === 'error') setState(it, 'error', m.message);
+  }
+  converting = false; converted = true;
+  const failed = todo.filter(i => i.state === 'error').length;
+  $msg.textContent = failed ? `${failed} photo${failed > 1 ? 's' : ''} failed; the rest are ready.` : '';
+  refresh();
+}
+
+function download() {
+  const ok = okItems().filter(i => i.result);
+  let href, name;
+  if (ok.length === 1) { href = ok[0].url; name = ok[0].outName; }
+  else {
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '');
+    href = URL.createObjectURL(new Blob(HEIC2JPG.zipStore(ok.map(i => ({ name: i.outName, data: i.result.bytes }))), { type: 'application/zip' }));
+    name = `heic2jpg-${stamp}.zip`;
+  }
+  const a = Object.assign(document.createElement('a'), { href, download: name });
+  document.body.appendChild(a); a.click(); a.remove();
+  if (ok.length > 1) setTimeout(() => URL.revokeObjectURL(href), 60_000);
+}
+
+$files.addEventListener('change', () => addFiles($files.files));
+$drop.addEventListener('dragover', e => { e.preventDefault(); $drop.classList.add('over'); });
+$drop.addEventListener('dragleave', () => $drop.classList.remove('over'));
+$drop.addEventListener('drop', e => { e.preventDefault(); $drop.classList.remove('over'); addFiles(e.dataTransfer.files); });
+$q.addEventListener('input', () => { $qv.textContent = $q.value; converted = false; refresh(); });
+$convert.addEventListener('click', convert);
+$download.addEventListener('click', download);
+</script>
+</body>
+</html>

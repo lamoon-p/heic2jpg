@@ -120,11 +120,14 @@ function uniqueName(base, used) {
   return name;
 }
 
+let addGen = 0;
 async function addFiles(list) {
   if (converting) return;
+  const gen = ++addGen;           // a second selection while files are still being read cancels this one
   reset();
   const used = new Set();
   for (const file of list) {
+    if (gen !== addGen) return;
     const li = document.createElement('li');
     li.innerHTML = '<span class="name"></span><span class="status">reading…</span>';
     li.querySelector('.name').textContent = file.name;
@@ -133,6 +136,7 @@ async function addFiles(list) {
     items.push(it);
     if (file.size > MAX_BYTES) { setState(it, 'error', 'over 100 MB, skipped'); continue; }
     const buffer = await file.arrayBuffer();
+    if (gen !== addGen) return;
     worker.postMessage({ type: 'open', id: it.id, buffer }, [buffer]);
   }
 }
